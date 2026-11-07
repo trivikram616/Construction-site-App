@@ -40,17 +40,20 @@ import {
   AttendanceStatus,
   Project,
   UserProfile,
-  SalaryType
+  SalaryType,
+  WorkerPayrollEditInput
 } from '../types';
 import { attendanceService } from '../services/attendanceService';
 import { dataService } from '../services/dataService';
 import { CreateGroupModal } from './CreateGroupModal';
 import { AddEmployeeModal } from './AddEmployeeModal';
 import { RecordPaymentModal } from './RecordPaymentModal';
+import { EditWorkerPayrollModal } from './EditWorkerPayrollModal';
 import { AttachmentFileLink, AttachmentLinks } from './AttachmentSections';
 import { getLocalDateString, getLocalDateStringOffset, getLocalMonthStartString, getLocalYearStartString } from '../utils/dateUtils';
 import { useCompanyBranding } from '../contexts/CompanyBrandingContext';
 import { CompanyLogo } from './CompanyLogo';
+import { IndividualAttendanceView } from './IndividualAttendanceView';
 
 interface AttendanceViewProps {
   currentUser: UserProfile;
@@ -58,6 +61,9 @@ interface AttendanceViewProps {
   onNavigateHome?: () => void;
   onNavigateProjects?: () => void;
 }
+
+// Keep this feature switchable if the client later decides to disable deletion.
+const ENABLE_EMPLOYEE_DELETE = true;
 
 export const AttendanceView: React.FC<AttendanceViewProps> = ({
   currentUser,
@@ -68,6 +74,7 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
   const { companyName, companyLogoUrl } = useCompanyBranding();
   // Navigation State
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(initialGroupId || null);
+  const [attendanceMode, setAttendanceMode] = useState<'group' | 'individual'>('group');
   const [activeTab, setActiveTab] = useState<'mark' | 'employees' | 'history' | 'salary' | 'reports'>('mark');
 
   // Core Data State
@@ -85,11 +92,15 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
   const [isAddEmployeeOpen, setIsAddEmployeeOpen] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
   const [addEmployeeDefaultGroupId, setAddEmployeeDefaultGroupId] = useState<string | undefined>(undefined);
-  const [assignSuccessMessage, setAssignSuccessMessage] = useState<string | null>(null);
+  const [groupAssignmentMessage, setGroupAssignmentMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
 
   const [isRecordPaymentOpen, setIsRecordPaymentOpen] = useState(false);
   const [paymentTargetEmployee, setPaymentTargetEmployee] = useState<Employee | null>(null);
   const [paymentSuggestedAmount, setPaymentSuggestedAmount] = useState<number | undefined>(undefined);
+  const [editingPayrollEmployee, setEditingPayrollEmployee] = useState<Employee | null>(null);
+  const [payrollEditMessage, setPayrollEditMessage] = useState<string | null>(null);
+  const [employeeStatusMessage, setEmployeeStatusMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
+  const [activatingEmployeeId, setActivatingEmployeeId] = useState<string | null>(null);
 
   // Group Search & Filter
   const [groupSearch, setGroupSearch] = useState('');
@@ -121,6 +132,14 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
   // Salary & Payments State
   const [salarySummaries, setSalarySummaries] = useState<EmployeeSalarySummary[]>([]);
   const [salaryPeriod, setSalaryPeriod] = useState<'this_month' | 'last_30_days' | 'all'>('this_month');
+  const salaryDateRange = useMemo(() => ({
+    fromDate: salaryPeriod === 'last_30_days'
+      ? getLocalDateStringOffset(-29)
+      : salaryPeriod === 'all'
+      ? getLocalYearStartString()
+      : getLocalMonthStartString(),
+    toDate: getLocalDateString()
+  }), [salaryPeriod]);
 
   // Reports State
   const [reportMode, setReportMode] = useState<'date_range' | 'up_to_date'>('date_range');
@@ -269,22 +288,15 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
   useEffect(() => {
     if (!selectedGroupId) return;
     async function loadSalary() {
-      let fromDate = getLocalMonthStartString();
-      let toDate = getLocalDateString();
-      if (salaryPeriod === 'last_30_days') {
-        fromDate = getLocalDateStringOffset(-29);
-      } else if (salaryPeriod === 'all') {
-        fromDate = getLocalYearStartString();
-      }
       const sums = await attendanceService.computeSalarySummaries({
         groupId: selectedGroupId || undefined,
-        fromDate,
-        toDate
+        fromDate: salaryDateRange.fromDate,
+        toDate: salaryDateRange.toDate
       });
       setSalarySummaries(sums);
     }
     loadSalary();
-  }, [selectedGroupId, salaryPeriod, attendanceRecords, paymentRecords, employees]);
+  }, [selectedGroupId, salaryDateRange, attendanceRecords, paymentRecords, employees]);
 
   // Load report data when reports tab is active or report parameters change
   useEffect(() => {
@@ -363,6 +375,20 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
     }
   };
 
+  const handleDeleteEmployee = async (employee: Employee) => {
+    const confirmed = window.confirm(
+      `Delete ${employee.full_name} (${employee.employee_code})? This removes the employee profile. Employees with attendance or payment history must be deactivated instead.`
+    );
+    if (!confirmed) return;
+
+    try {
+      await attendanceService.deleteEmployee(employee.id);
+      await loadData();
+    } catch (err: any) {
+      alert(err.message || 'Cannot delete this employee.');
+    }
+  };
+
   const handleToggleGroupStatus = async (group: AttendanceGroup) => {
     const nextStatus = group.status === 'active' ? 'inactive' : 'active';
     await attendanceService.updateGroup(group.id, {
@@ -374,28 +400,90 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
 
   // Handlers for Employee CRUD
   const handleSaveEmployee = async (employeeData: any) => {
+    const removedFromGroup = Boolean(editingEmployee?.group_id && !employeeData.group_id);
+    const previousGroupName = editingEmployee?.group_name;
+    let savedEmployee: Employee;
     if (editingEmployee) {
-      await attendanceService.updateEmployee(editingEmployee.id, employeeData);
+      savedEmployee = await attendanceService.updateEmployee(editingEmployee.id, employeeData);
     } else {
-      await attendanceService.createEmployee(employeeData);
+      savedEmployee = await attendanceService.createEmployee(employeeData);
     }
+    setEmployees(current => current.some(employee => employee.id === savedEmployee.id)
+      ? current.map(employee => employee.id === savedEmployee.id ? savedEmployee : employee)
+      : [savedEmployee, ...current]);
     await loadData();
+    if (removedFromGroup && editingEmployee) {
+      setGroupAssignmentMessage({
+        kind: 'success',
+        text: `${editingEmployee.full_name} (${editingEmployee.employee_code}) was removed from ${previousGroupName || 'the group'} and is now available in Individual Attendance. Historical attendance and payroll records were preserved.`
+      });
+    }
     setEditingEmployee(null);
     setAddEmployeeDefaultGroupId(undefined);
   };
 
+  const handleActivateWorker = async (employeeId: string) => {
+    if (!canManage) return;
+
+    const employee = employees.find(candidate =>
+      candidate.id === employeeId
+      && candidate.company_id?.trim() === currentUser.company_id.trim()
+      && candidate.group_id === selectedGroupId
+    );
+    if (!employee) {
+      setEmployeeStatusMessage({ kind: 'error', text: 'This worker is no longer available in the selected company group. Refresh the page and try again.' });
+      return;
+    }
+    if (employee.status !== 'inactive') {
+      setEmployeeStatusMessage({ kind: 'error', text: `${employee.full_name} is already active. Refresh the page to see the latest status.` });
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Activate ${employee.full_name} (${employee.employee_code})? The existing employee ID, code, group and project assignments, and attendance, salary, advance, and payment history will be preserved.`
+    );
+    if (!confirmed) return;
+
+    setEmployeeStatusMessage(null);
+    setActivatingEmployeeId(employee.id);
+    try {
+      const updatedEmployee = await attendanceService.updateEmployee(employee.id, { status: 'active' });
+      setEmployees(current => current.map(candidate =>
+        candidate.id === updatedEmployee.id && candidate.company_id === updatedEmployee.company_id
+          ? updatedEmployee
+          : candidate
+      ));
+      await loadData();
+      setEmployeeStatusMessage({
+        kind: 'success',
+        text: `${employee.full_name} (${employee.employee_code}) is active. Employee, attendance, and salary data were refreshed.`
+      });
+    } catch (err) {
+      setEmployeeStatusMessage({
+        kind: 'error',
+        text: err instanceof Error ? err.message : 'The worker could not be activated.'
+      });
+    } finally {
+      setActivatingEmployeeId(null);
+    }
+  };
+
   // Handler for assigning an ungrouped employee to an existing group
   const handleAssignGroup = async (employeeId: string, targetGroupId: string) => {
+    setGroupAssignmentMessage(null);
+    const previousEmployee = employees.find(employee => employee.id === employeeId);
     try {
       const updated = await attendanceService.assignEmployeeToGroup(employeeId, targetGroupId);
+      setEmployees(current => current.map(employee => employee.id === updated.id ? updated : employee));
       await loadData();
-      const targetGroup = groups.find(g => g.id === targetGroupId);
-      setAssignSuccessMessage(
-        `${updated.full_name} (${updated.employee_code}) was successfully assigned to ${targetGroup ? targetGroup.name : 'the group'}! Historical attendance & payroll records preserved.`
-      );
-      setTimeout(() => setAssignSuccessMessage(null), 6000);
+      const targetGroup = groups.find(group => group.id === targetGroupId);
+      const text = targetGroupId
+        ? `${updated.full_name} (${updated.employee_code}) was assigned to ${targetGroup?.name || 'the group'}. Historical attendance and payroll records were preserved.`
+        : `${updated.full_name} (${updated.employee_code}) was removed from ${previousEmployee?.group_name || 'the group'} and is now available in Individual Attendance. Historical attendance and payroll records were preserved.`;
+      setGroupAssignmentMessage({ kind: 'success', text });
+      window.setTimeout(() => setGroupAssignmentMessage(null), 6000);
     } catch (err: any) {
-      alert(err.message || 'Failed to assign group.');
+      setGroupAssignmentMessage({ kind: 'error', text: err.message || 'Worker group assignment was not saved.' });
     }
   };
 
@@ -507,6 +595,19 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
     setIsRecordPaymentOpen(false);
   };
 
+  const handleSaveWorkerPayroll = async (payrollData: WorkerPayrollEditInput) => {
+    await attendanceService.updateWorkerPayroll(payrollData);
+    await loadData();
+    setEditingPayrollEmployee(null);
+    setPayrollEditMessage('Worker payroll changes were saved and the payment summary was refreshed.');
+    window.setTimeout(() => setPayrollEditMessage(null), 6000);
+  };
+
+  const handleDeleteWorkerPayment = async (paymentId: string, employeeId: string, groupId?: string) => {
+    await attendanceService.deleteSalaryPayment(paymentId, employeeId, groupId);
+    await loadData();
+  };
+
   // CSV Export for Reports Tab
   const handleDownloadReportCsv = () => {
     const groupName = reportGroupScope === 'all'
@@ -548,6 +649,30 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
 
   return (
     <div className="space-y-6 animate-in fade-in duration-150 font-['Inter',sans-serif]">
+
+      <nav aria-label="Attendance type" role="tablist" className="inline-flex max-w-full flex-wrap gap-1 rounded-xl border border-bp-border bg-white p-1 shadow-xs">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={attendanceMode === 'group'}
+          onClick={() => setAttendanceMode('group')}
+          className={`min-h-10 rounded-lg px-4 text-sm font-semibold transition-colors ${attendanceMode === 'group' ? 'bg-bp-navy text-white' : 'text-bp-muted hover:bg-bp-background hover:text-bp-text'}`}
+        >
+          Group Attendance
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={attendanceMode === 'individual'}
+          onClick={() => {
+            setSelectedGroupId(null);
+            setAttendanceMode('individual');
+          }}
+          className={`min-h-10 rounded-lg px-4 text-sm font-semibold transition-colors ${attendanceMode === 'individual' ? 'bg-bp-navy text-white' : 'text-bp-muted hover:bg-bp-background hover:text-bp-text'}`}
+        >
+          Individual Attendance
+        </button>
+      </nav>
       
       {/* Breadcrumb Navigation */}
       <nav aria-label="Breadcrumb" className="flex items-center gap-2 text-xs text-bp-muted">
@@ -558,7 +683,11 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
           </button>
         )}
         <ChevronRight className="w-3.5 h-3.5 text-bp-muted" />
-        {selectedGroupId ? (
+        {attendanceMode === 'individual' ? (
+          <span className="font-semibold text-bp-text flex items-center gap-1.5">
+            <UserPlus className="w-3.5 h-3.5 text-bp-cyan" /> Individual Attendance
+          </span>
+        ) : selectedGroupId ? (
           <>
             <button
               onClick={() => setSelectedGroupId(null)}
@@ -578,10 +707,34 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
         )}
       </nav>
 
+      {groupAssignmentMessage && (
+        <div
+          role={groupAssignmentMessage.kind === 'success' ? 'status' : 'alert'}
+          className={`rounded-xl border p-3 text-xs ${groupAssignmentMessage.kind === 'success'
+            ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+            : 'border-rose-200 bg-rose-50 text-rose-800'}`}
+        >
+          {groupAssignmentMessage.text}
+        </div>
+      )}
+      {payrollEditMessage && <div role="status" className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800">{payrollEditMessage}</div>}
+
       {/* ======================================================== */}
       {/* SCREEN 1: ATTENDANCE GROUPS HOME SCREEN */}
       {/* ======================================================== */}
-      {!selectedGroupId ? (
+      {attendanceMode === 'individual' ? (
+        <IndividualAttendanceView
+          currentUser={currentUser}
+          employees={employees}
+          onRecordsChanged={loadData}
+          onOpenGroupRecord={record => {
+            setAttendanceMode('group');
+            setSelectedGroupId(record.group_id || null);
+            setAttendanceDate(record.date);
+            setActiveTab('mark');
+          }}
+        />
+      ) : !selectedGroupId ? (
         <div className="space-y-6">
           
           {/* Hero Banner with Create Group Button */}
@@ -901,13 +1054,6 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
               </div>
             </div>
 
-            {assignSuccessMessage && (
-              <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center gap-2 animate-in fade-in">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                <span className="font-medium">{assignSuccessMessage}</span>
-              </div>
-            )}
-
             {/* Individual Employees Table */}
             {individualEmployees.length === 0 ? (
               <div className="bg-bp-background rounded-xl border border-dashed border-bp-border-strong p-8 text-center space-y-2">
@@ -1011,6 +1157,16 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                                 title="Edit employee details"
                               >
                                 <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {isAdmin && ENABLE_EMPLOYEE_DELETE && (
+                              <button
+                                onClick={() => void handleDeleteEmployee(emp)}
+                                className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-50 rounded-lg transition-colors"
+                                title="Delete employee (blocked when attendance or payment history exists)"
+                                aria-label={`Delete ${emp.full_name}`}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             )}
                           </div>
@@ -1553,6 +1709,14 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                     {canManage && (
                       <div className="pt-2 border-t border-bp-border flex items-center justify-end gap-2">
                         <button
+                          type="button"
+                          onClick={() => void handleAssignGroup(emp.id, '')}
+                          className="px-3 py-1 bg-rose-50 hover:bg-rose-100 text-xs font-semibold text-rose-700 rounded-xl transition-colors"
+                          title={`Remove ${emp.full_name} from ${activeGroup?.name || 'this group'} without deleting employee or history`}
+                        >
+                          Remove from Group
+                        </button>
+                        <button
                           onClick={() => {
                             setEditingEmployee(emp);
                             setIsAddEmployeeOpen(true);
@@ -1562,6 +1726,16 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                           <Edit2 className="w-3 h-3" />
                           Edit Details
                         </button>
+                        {isAdmin && ENABLE_EMPLOYEE_DELETE && (
+                          <button
+                            onClick={() => void handleDeleteEmployee(emp)}
+                            className="px-3 py-1 bg-rose-50 hover:bg-rose-100 text-xs font-semibold text-rose-700 rounded-xl flex items-center gap-1 transition-colors"
+                            title="Delete employee (blocked when attendance or payment history exists)"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            Delete
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1681,6 +1855,16 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
           {/* ======================================================== */}
           {activeTab === 'salary' && (
             <div className="space-y-4">
+              {employeeStatusMessage && (
+                <div
+                  role={employeeStatusMessage.kind === 'success' ? 'status' : 'alert'}
+                  className={`rounded-xl border p-3 text-xs ${employeeStatusMessage.kind === 'success'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                    : 'border-rose-200 bg-rose-50 text-rose-800'}`}
+                >
+                  {employeeStatusMessage.text}
+                </div>
+              )}
               
               {/* Controls & Record Payment button */}
               <div className="bg-white rounded-2xl border border-bp-border p-4 sm:p-5 shadow-xs flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
@@ -1733,6 +1917,7 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                     <thead className="bg-bp-navy text-white uppercase font-bold text-[11px]">
                       <tr>
                         <th className="px-4 py-3">Worker Name</th>
+                        <th className="px-3 py-3 text-center">Employment Status</th>
                         <th className="px-3 py-3">Trade</th>
                         <th className="px-2 py-3 text-center">Rate</th>
                         <th className="px-2 py-3 text-center">P / HD / A</th>
@@ -1742,22 +1927,41 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                         <th className="px-3 py-3 text-right text-rose-400">Advances / Ded.</th>
                         <th className="px-3 py-3 text-right text-emerald-400">Paid Out</th>
                         <th className="px-3 py-3 text-right font-bold text-white bg-slate-900">Remaining Balance</th>
+                        <th className="px-3 py-3 text-center">Edit</th>
                         <th className="px-3 py-3 text-center">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#E2E8F0]">
                       {salarySummaries.length === 0 ? (
                         <tr>
-                          <td colSpan={11} className="px-4 py-10 text-center text-bp-muted">
+                          <td colSpan={13} className="px-4 py-10 text-center text-bp-muted">
                             No salary or payment records calculated for this period.
                           </td>
                         </tr>
                       ) : (
-                        salarySummaries.map(s => (
+                        salarySummaries.map(s => {
+                          const salaryEmployee = employees.find(employee =>
+                            employee.id === s.employee_id
+                            && employee.company_id?.trim() === currentUser.company_id.trim()
+                            && employee.group_id === selectedGroupId
+                          );
+
+                          return (
                           <tr key={s.employee_id} className="hover:bg-bp-background transition-colors">
                             <td className="px-4 py-3 font-semibold text-bp-text">
                               {s.employee_name}
                               <span className="block text-[10px] text-bp-muted font-mono">{s.employee_code}</span>
+                            </td>
+                            <td className="px-3 py-3 text-center">
+                              {salaryEmployee ? (
+                                <span className={`inline-flex rounded-full px-2 py-1 text-[10px] font-semibold uppercase ${salaryEmployee.status === 'active'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : 'bg-slate-100 text-slate-700'}`}>
+                                  {salaryEmployee.status === 'active' ? 'Active' : 'Inactive'}
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-bp-muted">Unavailable</span>
+                              )}
                             </td>
                             <td className="px-3 py-3 text-bp-text-subtle">{s.job_type}</td>
                             <td className="px-2 py-3 text-center font-mono">₹{s.salary_rate}</td>
@@ -1787,18 +1991,49 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                                 <button
                                   onClick={() => {
                                     const empObj = employees.find(e => e.id === s.employee_id) || null;
-                                    setPaymentTargetEmployee(empObj);
-                                    setPaymentSuggestedAmount(Math.max(0, s.net_payable_balance));
-                                    setIsRecordPaymentOpen(true);
+                                    setEditingPayrollEmployee(empObj);
                                   }}
-                                  className="px-2.5 py-1 text-xs font-semibold bg-bp-navy text-bp-cyan hover:bg-bp-navy-light rounded-xl transition-colors shadow-xs"
+                                  className="inline-flex items-center gap-1 rounded-xl border border-bp-border-strong px-2.5 py-1 text-xs font-semibold text-bp-navy transition-colors hover:bg-bp-background"
+                                  aria-label={`Edit payroll for ${s.employee_name}`}
                                 >
-                                  Pay
+                                  <Edit2 className="h-3 w-3" />
+                                  Edit
                                 </button>
                               )}
                             </td>
+                            <td className="px-3 py-3 text-center">
+                              {canManage && (
+                                <div className="flex flex-col items-center gap-1.5">
+                                  {salaryEmployee?.status === 'inactive' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleActivateWorker(s.employee_id)}
+                                      disabled={activatingEmployeeId === salaryEmployee.id}
+                                      className="whitespace-nowrap rounded-xl bg-emerald-700 px-2.5 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-emerald-800 disabled:cursor-wait disabled:opacity-60"
+                                    >
+                                      {activatingEmployeeId === salaryEmployee.id ? 'Activating…' : 'Activate Worker'}
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => {
+                                      const empObj = employees.find(e =>
+                                        e.company_id?.trim() === currentUser.company_id.trim()
+                                        && (e.id === s.employee_id || e.employee_code.trim().toLowerCase() === s.employee_code.trim().toLowerCase())
+                                      ) || null;
+                                      setPaymentTargetEmployee(empObj);
+                                      setPaymentSuggestedAmount(Math.max(0, s.net_payable_balance));
+                                      setIsRecordPaymentOpen(true);
+                                    }}
+                                    className="px-2.5 py-1 text-xs font-semibold bg-bp-navy text-bp-cyan hover:bg-bp-navy-light rounded-xl transition-colors shadow-xs"
+                                  >
+                                    Pay
+                                  </button>
+                                </div>
+                              )}
+                            </td>
                           </tr>
-                        ))
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
@@ -2136,6 +2371,7 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
         editingEmployee={editingEmployee}
         groups={groups}
         projects={projects}
+        employees={employees}
         defaultGroupId={addEmployeeDefaultGroupId !== undefined ? addEmployeeDefaultGroupId : (selectedGroupId || undefined)}
         onUploadFile={(file) => dataService.uploadPrivateAttachment(file, selectedGroupId || 'attendance')}
       />
@@ -2154,6 +2390,43 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
         suggestedAmount={paymentSuggestedAmount}
         onUploadFile={(file) => dataService.uploadAttachment(file, selectedGroupId || 'attendance')}
       />
+
+      {editingPayrollEmployee && (() => {
+        const summary = salarySummaries.find(item => item.employee_id === editingPayrollEmployee.id);
+        if (!summary) return null;
+        const matchesSalaryGroup = (record: { group_id?: string }) =>
+          !selectedGroupId || selectedGroupId === 'all' || record.group_id === selectedGroupId;
+        const scopedAttendance = attendanceRecords.filter(record =>
+          record.employee_id === editingPayrollEmployee.id
+          && record.date >= salaryDateRange.fromDate
+          && record.date <= salaryDateRange.toDate
+          && matchesSalaryGroup(record)
+        );
+        const scopedPayments = paymentRecords.filter(payment =>
+          payment.employee_id === editingPayrollEmployee.id
+          && payment.payment_date >= salaryDateRange.fromDate
+          && payment.payment_date <= salaryDateRange.toDate
+          && matchesSalaryGroup(payment)
+        );
+        return (
+          <EditWorkerPayrollModal
+            key={`${editingPayrollEmployee.id}:${salaryPeriod}`}
+            employee={editingPayrollEmployee}
+            groupId={selectedGroupId === 'all' ? undefined : selectedGroupId || undefined}
+            period={salaryDateRange}
+            attendanceRecords={scopedAttendance}
+            paymentRecords={scopedPayments}
+            onUploadFile={(file) => dataService.uploadAttachment(file, selectedGroupId || 'attendance')}
+            onDeletePayment={paymentId => handleDeleteWorkerPayment(
+              paymentId,
+              editingPayrollEmployee.id,
+              selectedGroupId === 'all' ? undefined : selectedGroupId || undefined
+            )}
+            onClose={() => setEditingPayrollEmployee(null)}
+            onSubmit={handleSaveWorkerPayroll}
+          />
+        );
+      })()}
 
     </div>
   );

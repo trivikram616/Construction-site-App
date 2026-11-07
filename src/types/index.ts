@@ -363,6 +363,7 @@ export type EmployeeJobType =
   | 'Barbender'
   | 'Painter'
   | 'Supervisor'
+  | 'Helper'
   | 'Other';
 
 export type SalaryType = 'daily_wage' | 'monthly_salary' | 'contract';
@@ -758,6 +759,9 @@ export interface DailyAttendanceRecord {
   group_name?: string;
   project_id?: string;
   project_name?: string;
+  site_id?: string;
+  site_name?: string;
+  attendance_source?: 'group' | 'individual';
   employee_id: string;
   employee_code: string;
   employee_name: string;
@@ -827,5 +831,18 @@ export interface EmployeeSalarySummary {
   total_paid: number;
   net_payable_balance: number;
   attendance_count: number;
+}
+
+export interface WorkerPayrollEditInput {
+  employee_id: string;
+  group_id?: string;
+  period_from: string;
+  period_to: string;
+  employee: Pick<Employee,
+    'employee_code' | 'full_name' | 'phone' | 'address' | 'job_type' | 'salary_type' |
+    'salary_amount' | 'standard_hours_per_day' | 'overtime_rate_per_hour' | 'remarks'>;
+  attendance: Array<Pick<DailyAttendanceRecord, 'id' | 'date' | 'status' | 'working_hours' | 'overtime_hours' | 'remarks'>>;
+  payments: Array<Pick<SalaryPaymentRecord,
+    'id' | 'payment_date' | 'amount' | 'payment_method' | 'payment_type' | 'reference_no' | 'remarks' | 'attachments'>>;
 }
 

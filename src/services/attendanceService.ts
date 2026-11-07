@@ -1,4 +1,5 @@
 import { dataService } from './dataService';
+import { authService } from './authService';
 import {
   AttendanceGroup,
   Employee,
@@ -8,9 +9,11 @@ import {
   AttendanceStatus,
   SalaryType,
   EmployeeJobType,
-  Project
+  Project,
+  WorkerPayrollEditInput
 } from '../types';
 import { getLocalDateString } from '../utils/dateUtils';
+import { getNextEmployeeCode, recordIssuedEmployeeCode } from '../utils/employeeCode';
 
 const STORAGE_KEYS = {
   GROUPS: 'buildpulse_attendance_groups_v1',
@@ -19,6 +22,29 @@ const STORAGE_KEYS = {
   PAYMENTS: 'buildpulse_salary_payments_v1',
   AUDIT_LOGS: 'buildpulse_attendance_audit_v1'
 };
+
+export class DuplicateAttendanceRecordError extends Error {
+  public readonly existingRecord: DailyAttendanceRecord;
+
+  constructor(existingRecord: DailyAttendanceRecord) {
+    super('Attendance already exists for this employee, project, and date. Review the existing record before making changes.');
+    this.name = 'DuplicateAttendanceRecordError';
+    this.existingRecord = existingRecord;
+  }
+}
+
+export type IndividualAttendanceStatus = Extract<AttendanceStatus, 'Present' | 'Absent' | 'Half Day' | 'Leave'>;
+
+export interface IndividualAttendanceInput {
+  employee_id: string;
+  project_id: string;
+  site_id?: string;
+  date: string;
+  status: IndividualAttendanceStatus;
+  working_hours: number;
+  overtime_hours: number;
+  remarks?: string;
+}
 
 // Seed realistic initial groups (e.g., Dan Group, Ram Group, and Shankar MEP Gang)
 export const INITIAL_GROUPS: AttendanceGroup[] = [
@@ -867,6 +893,13 @@ class AttendanceService {
     return employees.find(e => e.id === employeeId) || null;
   }
 
+  private async refreshEmployeeDataBeforeWrite(): Promise<void> {
+    if (dataService.isCloudConfigured() && !dataService.isCloudConnected()) {
+      throw new Error('Supabase is configured but not connected. The employee change was not saved; restore the cloud connection and retry.');
+    }
+    if (dataService.isCloudConnected()) await dataService.syncCloudState();
+  }
+
   public async createEmployee(input: {
     employee_code?: string;
     full_name: string;
@@ -901,15 +934,8 @@ class AttendanceService {
 
     const employees = await this.getEmployees();
 
-    // Auto-generate unique code if not provided
-    let empCode = input.employee_code?.trim();
-    if (!empCode) {
-      const prefix = targetGroup
-        ? (targetGroup.name.replace(/[^a-zA-Z]/g, '').slice(0, 3).toUpperCase() || 'EMP')
-        : 'IND';
-      const seq = (employees.length + 1).toString().padStart(3, '0');
-      empCode = `EMP-${prefix}-${seq}`;
-    }
+    // Individual and group onboarding share the same company-wide sequence.
+    const empCode = getNextEmployeeCode(employees);
 
     // Verify code uniqueness
     if (employees.some(e => e.employee_code.toLowerCase() === empCode!.toLowerCase())) {
@@ -925,17 +951,20 @@ class AttendanceService {
     const projId = input.project_id || targetGroup?.project_id;
     if (projId) {
       const p = await dataService.getProjectById(projId);
+      if (!p || p.company_id !== currentUser.company_id) {
+        throw new Error('Select a project from your company.');
+      }
       projectName = p?.name;
     }
 
     const stdHours = Number(input.standard_hours_per_day) || 8;
     const otRate = input.overtime_rate_per_hour !== undefined
       ? Number(input.overtime_rate_per_hour)
-      : Math.round((wage / stdHours) * 1.5);
+      : 0;
 
     const newEmp: Employee = {
       id: `emp-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
-      company_id: 'comp-apex-01',
+      company_id: currentUser.company_id,
       employee_code: empCode,
       full_name: trimmedName,
       photo_url: input.photo_url,
@@ -960,39 +989,43 @@ class AttendanceService {
 
     const updated = [newEmp, ...employees];
     localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(updated));
+    recordIssuedEmployeeCode(empCode);
     this.recordAudit('create_employee', newEmp.id, { name: newEmp.full_name, code: newEmp.employee_code, group: newEmp.group_name || 'Individual' });
     await dataService.persistCloudState();
     return newEmp;
   }
 
   public async updateEmployee(employeeId: string, input: {
-    employee_code?: string;
-    full_name: string;
-    photo_url?: string;
-    documents?: import('../types').EmployeeDocuments;
-    phone?: string;
-    address?: string;
-    job_type: EmployeeJobType | string;
-    group_id?: string;
-    project_id?: string;
-    joining_date?: string;
-    salary_type: SalaryType;
-    salary_amount: number;
-    standard_hours_per_day?: number;
-    overtime_rate_per_hour?: number;
-    status?: 'active' | 'inactive';
-    remarks?: string;
+    employee_code?: Employee['employee_code'];
+    full_name?: Employee['full_name'];
+    photo_url?: Employee['photo_url'];
+    documents?: Employee['documents'];
+    phone?: Employee['phone'];
+    address?: Employee['address'];
+    job_type?: Employee['job_type'];
+    group_id?: Employee['group_id'];
+    project_id?: Employee['project_id'];
+    joining_date?: Employee['joining_date'];
+    salary_type?: SalaryType;
+    salary_amount?: Employee['salary_amount'];
+    standard_hours_per_day?: Employee['standard_hours_per_day'];
+    overtime_rate_per_hour?: Employee['overtime_rate_per_hour'];
+    status?: Employee['status'];
+    remarks?: Employee['remarks'];
   }): Promise<Employee> {
     const currentUser = dataService.getCurrentUser();
     if (currentUser.role !== 'admin' && currentUser.role !== 'project_manager') {
       throw new Error('Access Denied: Only Administrators and Project Managers can update employee records.');
     }
 
+    await this.refreshEmployeeDataBeforeWrite();
+    const previousEmployees = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
+    const previousAuditLog = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
     const employees = await this.getEmployees();
-    const idx = employees.findIndex(e => e.id === employeeId);
+    const idx = employees.findIndex(e => e.id === employeeId && this.companyIdsMatch(e.company_id, currentUser.company_id));
     if (idx === -1) throw new Error('Employee not found.');
 
-    const trimmedName = input.full_name.trim();
+    const trimmedName = input.full_name === undefined ? employees[idx].full_name : input.full_name.trim();
     if (!trimmedName) throw new Error('Employee full name is required.');
 
     const empCode = input.employee_code?.trim() || employees[idx].employee_code;
@@ -1000,8 +1033,8 @@ class AttendanceService {
       throw new Error(`Employee Code "${empCode}" is already in use by another worker.`);
     }
 
-    const wage = Number(input.salary_amount);
-    if (isNaN(wage) || wage <= 0) {
+    const wage = input.salary_amount === undefined ? employees[idx].salary_amount : Number(input.salary_amount);
+    if (input.salary_amount !== undefined && (isNaN(wage) || wage <= 0)) {
       throw new Error('Salary rate must be greater than zero.');
     }
 
@@ -1010,15 +1043,18 @@ class AttendanceService {
     if (input.group_id !== undefined) {
       if (input.group_id && input.group_id !== 'ungrouped') {
         const groups = await this.getGroups();
-        const g = groups.find(grp => grp.id === input.group_id);
-        if (g) targetGroupName = g.name;
+        const g = groups.find(grp => grp.id === input.group_id && grp.company_id === currentUser.company_id);
+        if (!g) throw new Error('Select a worker group from your company.');
+        targetGroupName = g.name;
       } else {
         targetGroupId = '';
         targetGroupName = undefined;
       }
     }
 
-    const stdHours = Number(input.standard_hours_per_day) || employees[idx].standard_hours_per_day || 8;
+    const stdHours = input.standard_hours_per_day === undefined
+      ? employees[idx].standard_hours_per_day
+      : Number(input.standard_hours_per_day) || employees[idx].standard_hours_per_day || 8;
     const otRate = input.overtime_rate_per_hour !== undefined
       ? Number(input.overtime_rate_per_hour)
       : employees[idx].overtime_rate_per_hour;
@@ -1036,7 +1072,7 @@ class AttendanceService {
       group_name: targetGroupName,
       project_id: input.project_id !== undefined ? input.project_id : employees[idx].project_id,
       joining_date: input.joining_date || employees[idx].joining_date,
-      salary_type: input.salary_type,
+      salary_type: input.salary_type || employees[idx].salary_type,
       salary_amount: wage,
       standard_hours_per_day: stdHours,
       overtime_rate_per_hour: otRate,
@@ -1046,10 +1082,73 @@ class AttendanceService {
     };
 
     employees[idx] = updatedEmp;
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
-    this.recordAudit('update_employee', employeeId, { name: updatedEmp.full_name, group: targetGroupName || 'Individual' });
-    await dataService.persistCloudState();
+    try {
+      localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
+      this.recordAudit('update_employee', employeeId, { name: updatedEmp.full_name, group: targetGroupName || 'Individual' });
+      await dataService.persistCloudState();
+    } catch (error) {
+      if (previousEmployees === null) localStorage.removeItem(STORAGE_KEYS.EMPLOYEES);
+      else localStorage.setItem(STORAGE_KEYS.EMPLOYEES, previousEmployees);
+      if (previousAuditLog === null) localStorage.removeItem(STORAGE_KEYS.AUDIT_LOGS);
+      else localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, previousAuditLog);
+      throw new Error(error instanceof Error
+        ? `Employee changes were not saved to Supabase. The previous assignment has been restored. ${error.message}`
+        : 'Employee changes were not saved to Supabase. The previous assignment has been restored.');
+    }
     return updatedEmp;
+  }
+
+  public async deleteEmployee(employeeId: string): Promise<void> {
+    const currentUser = dataService.getCurrentUser();
+    if (currentUser.role !== 'admin') {
+      throw new Error('Access Denied: Only Company Administrators can delete employees.');
+    }
+    if (dataService.isCloudConfigured() && !dataService.isCloudConnected()) {
+      throw new Error('Supabase is not connected, so this employee cannot be deleted across devices yet. Restore the cloud connection and retry.');
+    }
+
+    const employees = await this.getEmployees();
+    const employee = employees.find(item => item.id === employeeId);
+    if (!employee) throw new Error('Employee not found. Refresh the attendance page and try again.');
+
+    const [attendanceRecords, payments] = await Promise.all([
+      this.getAttendanceRecords({ employeeId }),
+      this.getPayments({ employeeId })
+    ]);
+    if (dataService.isCloudConfigured()) {
+      const result = await dataService.requestCloudUserAdmin('GET');
+      const linkedAccounts = Array.isArray(result.accounts)
+        ? result.accounts.filter((account: { employee_id?: string }) => account.employee_id === employeeId)
+        : [];
+      if (linkedAccounts.length > 0) {
+        throw new Error(
+          `Cannot delete ${employee.full_name} because ${linkedAccounts.length} login account(s) are linked to this employee. Unlink the account in User Management first.`
+        );
+      }
+    }
+    if (attendanceRecords.length > 0 || payments.length > 0) {
+      throw new Error(
+        `Cannot delete ${employee.full_name} because ${attendanceRecords.length} attendance record(s) and ${payments.length} payment record(s) are linked. Deactivate the employee to preserve the historical payroll and attendance records.`
+      );
+    }
+
+    const previousAuditLog = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
+    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees.filter(item => item.id !== employeeId)));
+    this.recordAudit('delete_employee', employeeId, {
+      employee_code: employee.employee_code,
+      name: employee.full_name,
+      deleted_by: currentUser.full_name
+    });
+    try {
+      await dataService.persistCloudState();
+    } catch (error) {
+      localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
+      if (previousAuditLog === null) localStorage.removeItem(STORAGE_KEYS.AUDIT_LOGS);
+      else localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, previousAuditLog);
+      throw new Error(error instanceof Error
+        ? `Employee deletion was not saved to Supabase. The employee has been restored locally. ${error.message}`
+        : 'Employee deletion was not saved to Supabase. The employee has been restored locally.');
+    }
   }
 
   /**
@@ -1057,8 +1156,16 @@ class AttendanceService {
    * Preserves all past attendance, salary, and payment history!
    */
   public async assignEmployeeToGroup(employeeId: string, groupId: string): Promise<Employee> {
+    const currentUser = dataService.getCurrentUser();
+    if (currentUser.role !== 'admin' && currentUser.role !== 'project_manager') {
+      throw new Error('Access Denied: Only Administrators and Project Managers can change worker group assignments.');
+    }
+
+    await this.refreshEmployeeDataBeforeWrite();
+    const previousEmployees = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
+    const previousAuditLog = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
     const employees = await this.getEmployees();
-    const idx = employees.findIndex(e => e.id === employeeId);
+    const idx = employees.findIndex(e => e.id === employeeId && e.company_id === currentUser.company_id);
     if (idx === -1) throw new Error('Employee not found.');
 
     const emp = employees[idx];
@@ -1069,7 +1176,7 @@ class AttendanceService {
 
     if (groupId && groupId !== 'ungrouped') {
       const groups = await this.getGroups();
-      const targetGroup = groups.find(g => g.id === groupId);
+      const targetGroup = groups.find(g => g.id === groupId && g.company_id === currentUser.company_id);
       if (!targetGroup) throw new Error('Selected group does not exist.');
       targetGroupId = targetGroup.id;
       targetGroupName = targetGroup.name;
@@ -1089,12 +1196,22 @@ class AttendanceService {
     };
 
     employees[idx] = updatedEmp;
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
-    this.recordAudit('assign_employee_group', employeeId, {
-      name: updatedEmp.full_name,
-      newGroup: targetGroupName || 'Ungrouped / Individual'
-    });
-    await dataService.persistCloudState();
+    try {
+      localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
+      this.recordAudit('assign_employee_group', employeeId, {
+        name: updatedEmp.full_name,
+        newGroup: targetGroupName || 'Ungrouped / Individual'
+      });
+      await dataService.persistCloudState();
+    } catch (error) {
+      if (previousEmployees === null) localStorage.removeItem(STORAGE_KEYS.EMPLOYEES);
+      else localStorage.setItem(STORAGE_KEYS.EMPLOYEES, previousEmployees);
+      if (previousAuditLog === null) localStorage.removeItem(STORAGE_KEYS.AUDIT_LOGS);
+      else localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, previousAuditLog);
+      throw new Error(error instanceof Error
+        ? `Worker group assignment was not saved to Supabase. The previous assignment has been restored. ${error.message}`
+        : 'Worker group assignment was not saved to Supabase. The previous assignment has been restored.');
+    }
     return updatedEmp;
   }
 
@@ -1273,18 +1390,25 @@ class AttendanceService {
 
       // Check if record exists for this employee + group + date
       const existingIdx = allRecords.findIndex(
-        r => r.employee_id === emp.id && r.group_id === groupId && r.date === date
+        r => r.employee_id === emp.id
+          && r.group_id === groupId
+          && r.date === date
+          && (r.project_id || group.project_id) === group.project_id
       );
+      const existingRecord = existingIdx !== -1 ? allRecords[existingIdx] : undefined;
 
       const record: DailyAttendanceRecord = {
         id: existingIdx !== -1
-          ? allRecords[existingIdx].id
+          ? existingRecord!.id
           : `att-${emp.id}-${date.replace(/-/g, '')}-${Math.random().toString(36).substring(2, 6)}`,
         company_id: 'comp-apex-01',
         group_id: groupId,
         group_name: group.name,
         project_id: group.project_id,
         project_name: group.project_name,
+        site_id: existingRecord?.site_id,
+        site_name: existingRecord?.site_name,
+        attendance_source: existingRecord?.attendance_source || 'group',
         employee_id: emp.id,
         employee_code: emp.employee_code,
         employee_name: emp.full_name,
@@ -1303,7 +1427,7 @@ class AttendanceService {
         remarks: entry.remarks?.trim(),
         recorded_by: currentUser.id,
         recorded_by_name: currentUser.full_name,
-        created_at: existingIdx !== -1 ? allRecords[existingIdx].created_at : new Date().toISOString(),
+        created_at: existingRecord?.created_at || new Date().toISOString(),
         updated_at: new Date().toISOString()
       };
 
@@ -1320,6 +1444,227 @@ class AttendanceService {
     this.recordAudit('save_attendance', `${groupId}_${date}`, { count: savedRecords.length, date });
     await dataService.persistCloudState();
     return savedRecords;
+  }
+
+  public canManageAttendance(projectId?: string): boolean {
+    return authService.canPerformAction('manage_attendance', projectId);
+  }
+
+  private async refreshAttendanceBeforeWrite(): Promise<void> {
+    if (dataService.isCloudConfigured() && !dataService.isCloudConnected()) {
+      throw new Error('Supabase is configured but not connected. Individual attendance was not saved; restore the cloud connection and retry.');
+    }
+    if (dataService.isCloudConnected()) await dataService.syncCloudState();
+  }
+
+  private async refreshPayrollBeforeWrite(): Promise<void> {
+    if (dataService.isCloudConfigured() && !dataService.isCloudConnected()) {
+      throw new Error('Supabase is configured but not connected. Payroll was not saved; restore the cloud connection and retry.');
+    }
+    if (dataService.isCloudConnected()) await dataService.syncCloudState();
+  }
+
+  private isValidPayrollDate(date: string): boolean {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const parsed = new Date(year, month - 1, day);
+    return parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day;
+  }
+
+  private salaryPaymentDuplicateKey(payment: Pick<SalaryPaymentRecord,
+    'company_id' | 'employee_id' | 'group_id' | 'payment_date' | 'amount' | 'payment_method' | 'payment_type' | 'reference_no'>): string {
+    const base = `${payment.company_id}|${payment.employee_id}|${payment.group_id || ''}|`;
+    const reference = payment.reference_no?.trim().toLowerCase();
+    return reference
+      ? `${base}ref:${reference}`
+      : `${base}${payment.payment_date}|${payment.amount}|${payment.payment_method}|${payment.payment_type}`;
+  }
+
+  private validateAttendanceDate(date: string): void {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (!match) throw new Error('Select a valid attendance date.');
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const parsed = new Date(year, month - 1, day);
+    if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) {
+      throw new Error('Select a valid attendance date.');
+    }
+  }
+
+  /** Save or update one employee's attendance in the shared attendance ledger. */
+  public async saveIndividualAttendance(
+    input: IndividualAttendanceInput,
+    recordId?: string
+  ): Promise<DailyAttendanceRecord> {
+    const currentUser = dataService.getCurrentUser();
+    if (!input.project_id || !this.canManageAttendance(input.project_id)) {
+      throw new Error('Access Denied: You do not have attendance permission for this project.');
+    }
+    this.validateAttendanceDate(input.date);
+    await this.refreshAttendanceBeforeWrite();
+
+    const employee = await this.getEmployeeById(input.employee_id);
+    if (!employee || employee.company_id !== currentUser.company_id) {
+      throw new Error('Select an employee from your company.');
+    }
+    if (employee.status !== 'active') throw new Error('Inactive employees cannot receive new attendance records.');
+    if (employee.joining_date && input.date < employee.joining_date) {
+      throw new Error('Attendance date cannot be earlier than the employee joining date.');
+    }
+
+    const project = await dataService.getProjectById(input.project_id);
+    if (!project || project.company_id !== currentUser.company_id) throw new Error('Select a project from your company.');
+
+    const locations = await dataService.getMaterialLocations(project.id);
+    let siteId: string | undefined;
+    let siteName = project.location.trim() || project.address.trim() || project.name;
+    if (input.site_id) {
+      const selectedLocation = locations.find(location =>
+        location.id === input.site_id && location.company_id === currentUser.company_id
+      );
+      if (!selectedLocation) throw new Error('Select a site that belongs to the selected project.');
+      siteId = selectedLocation.id;
+      siteName = selectedLocation.name;
+    } else if (locations.length > 0) {
+      throw new Error('Select a site for the selected project.');
+    }
+
+    const validStatuses: IndividualAttendanceStatus[] = ['Present', 'Absent', 'Half Day', 'Leave'];
+    if (!validStatuses.includes(input.status)) throw new Error('Select a valid attendance status.');
+
+    const workingHours = Number(input.working_hours);
+    const overtimeHours = Number(input.overtime_hours);
+    if (!Number.isFinite(workingHours) || workingHours < 0 || workingHours > 24) {
+      throw new Error('Working hours must be between 0 and 24.');
+    }
+    if (!Number.isFinite(overtimeHours) || overtimeHours < 0 || overtimeHours > 24) {
+      throw new Error('Overtime hours must be between 0 and 24.');
+    }
+    if ((input.status === 'Present' || input.status === 'Half Day') && workingHours <= 0) {
+      throw new Error('Enter working hours for present or half-day attendance.');
+    }
+    if ((input.status === 'Absent' || input.status === 'Leave') && (workingHours !== 0 || overtimeHours !== 0)) {
+      throw new Error('Absent and leave records must have zero working and overtime hours.');
+    }
+    if (overtimeHours > 0 && input.status !== 'Present' && input.status !== 'Half Day') {
+      throw new Error('Overtime can only be recorded for present or half-day attendance.');
+    }
+
+    const groups = await this.getGroups();
+    const employeeGroupId = employee.group_id && employee.group_id !== 'ungrouped' ? employee.group_id : undefined;
+    const employeeGroup = employeeGroupId
+      ? groups.find(group => group.id === employeeGroupId && group.company_id === currentUser.company_id)
+      : undefined;
+    const stored = localStorage.getItem(STORAGE_KEYS.ATTENDANCE_RECORDS);
+    let allRecords: DailyAttendanceRecord[] = stored ? JSON.parse(stored) : [];
+    if (!Array.isArray(allRecords)) throw new Error('Saved attendance data could not be read. Refresh and try again.');
+
+    const editingRecord = recordId ? allRecords.find(record => record.id === recordId) : undefined;
+    if (recordId && (!editingRecord || editingRecord.company_id !== currentUser.company_id || editingRecord.attendance_source !== 'individual')) {
+      throw new Error('Individual attendance record not found or cannot be edited from this screen.');
+    }
+    if (editingRecord?.project_id && editingRecord.project_id !== input.project_id
+      && !this.canManageAttendance(editingRecord.project_id)) {
+      throw new Error('Access Denied: You do not have permission to move this record from its current project.');
+    }
+
+    const duplicate = allRecords.find(record =>
+      record.id !== editingRecord?.id
+      && record.company_id === currentUser.company_id
+      && record.employee_id === employee.id
+      && (record.project_id
+        || (record.group_id ? groups.find(group => group.id === record.group_id)?.project_id : undefined)
+        || (record.employee_id === employee.id ? employee.project_id : undefined)) === project.id
+      && record.date === input.date
+    );
+    if (duplicate) throw new DuplicateAttendanceRecordError(duplicate);
+
+    const { payableDays, dailyEarnings } = this.calculateDailyEarnings(
+      input.status,
+      employee.salary_type,
+      employee.salary_amount,
+      overtimeHours,
+      employee.overtime_rate_per_hour || 0
+    );
+    const now = new Date().toISOString();
+    const record: DailyAttendanceRecord = {
+      id: editingRecord?.id || `att-ind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      company_id: currentUser.company_id,
+      group_id: employeeGroup?.id,
+      group_name: employeeGroup?.name || 'Individual / Direct Worker',
+      project_id: project.id,
+      project_name: project.name,
+      site_id: siteId,
+      site_name: siteName,
+      attendance_source: 'individual',
+      employee_id: employee.id,
+      employee_code: employee.employee_code,
+      employee_name: employee.full_name,
+      job_type: employee.job_type,
+      date: input.date,
+      status: input.status,
+      working_hours: input.status === 'Absent' || input.status === 'Leave' ? 0 : workingHours,
+      overtime_hours: input.status === 'Absent' || input.status === 'Leave' ? 0 : overtimeHours,
+      salary_type: employee.salary_type,
+      salary_rate: employee.salary_amount,
+      payable_days: payableDays,
+      daily_earnings: dailyEarnings,
+      remarks: input.remarks?.trim() || undefined,
+      recorded_by: currentUser.id,
+      recorded_by_name: currentUser.full_name,
+      created_at: editingRecord?.created_at || now,
+      updated_at: now
+    };
+
+    if (editingRecord) {
+      allRecords = allRecords.map(existing => existing.id === record.id ? record : existing);
+    } else {
+      allRecords.push(record);
+    }
+    localStorage.setItem(STORAGE_KEYS.ATTENDANCE_RECORDS, JSON.stringify(allRecords));
+    this.recordAudit(editingRecord ? 'update_individual_attendance' : 'create_individual_attendance', record.id, {
+      employee_id: record.employee_id,
+      project_id: record.project_id,
+      date: record.date,
+      status: record.status
+    });
+    await dataService.persistCloudState();
+    return record;
+  }
+
+  public async deleteIndividualAttendance(recordId: string): Promise<void> {
+    const currentUser = dataService.getCurrentUser();
+    const initialStored = localStorage.getItem(STORAGE_KEYS.ATTENDANCE_RECORDS);
+    const initialRecords: DailyAttendanceRecord[] = initialStored ? JSON.parse(initialStored) : [];
+    const initialRecord = initialRecords.find(item => item.id === recordId);
+    if (!initialRecord || initialRecord.company_id !== currentUser.company_id || initialRecord.attendance_source !== 'individual') {
+      throw new Error('Individual attendance record not found.');
+    }
+    if (!initialRecord.project_id || !this.canManageAttendance(initialRecord.project_id)) {
+      throw new Error('Access Denied: You do not have attendance permission for this project.');
+    }
+
+    await this.refreshAttendanceBeforeWrite();
+    const stored = localStorage.getItem(STORAGE_KEYS.ATTENDANCE_RECORDS);
+    const allRecords: DailyAttendanceRecord[] = stored ? JSON.parse(stored) : [];
+    const record = allRecords.find(item => item.id === recordId);
+    if (!record || record.company_id !== currentUser.company_id || record.attendance_source !== 'individual') {
+      throw new Error('Individual attendance record no longer exists. Refresh the history and try again.');
+    }
+    if (!record.project_id || !this.canManageAttendance(record.project_id)) {
+      throw new Error('Access Denied: You do not have attendance permission for this project.');
+    }
+    localStorage.setItem(STORAGE_KEYS.ATTENDANCE_RECORDS, JSON.stringify(allRecords.filter(item => item.id !== recordId)));
+    this.recordAudit('delete_individual_attendance', record.id, {
+      employee_id: record.employee_id,
+      project_id: record.project_id,
+      date: record.date
+    });
+    await dataService.persistCloudState();
   }
 
   // ==========================================
@@ -1372,25 +1717,38 @@ class AttendanceService {
       throw new Error('Access Denied: Only Administrators and Project Managers can disburse salary payments.');
     }
 
+    await this.refreshPayrollBeforeWrite();
+
     const amt = Number(input.amount);
-    if (isNaN(amt) || amt <= 0) {
+    if (!Number.isFinite(amt) || amt <= 0) {
       throw new Error('Payment amount must be greater than zero.');
     }
 
+    const paymentDate = input.payment_date || getLocalDateString();
+    const paymentType = input.payment_type || 'salary';
+    if (!this.isValidPayrollDate(paymentDate)) throw new Error('Enter a valid payment date.');
+    if (!['salary', 'advance', 'bonus', 'deduction'].includes(paymentType)) throw new Error('Select a valid payment type.');
+    if (!['Cash', 'Bank Transfer', 'UPI', 'Cheque'].includes(input.payment_method)) throw new Error('Select a valid payment method.');
+
     const employee = await this.getEmployeeById(input.employee_id);
     if (!employee) throw new Error('Employee not found.');
+    if (employee.company_id !== currentUser.company_id) throw new Error('Select an employee from your company.');
+
+    const stored = localStorage.getItem(STORAGE_KEYS.PAYMENTS);
+    const all: SalaryPaymentRecord[] = stored ? JSON.parse(stored) : [];
+    if (!Array.isArray(all)) throw new Error('Saved payment data could not be read. Refresh and try again.');
 
     const newPayment: SalaryPaymentRecord = {
       id: `pay-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
-      company_id: 'comp-apex-01',
+      company_id: currentUser.company_id,
       group_id: input.group_id,
       employee_id: employee.id,
       employee_name: employee.full_name,
       employee_code: employee.employee_code,
-      payment_date: input.payment_date || getLocalDateString(),
+      payment_date: paymentDate,
       amount: amt,
       payment_method: input.payment_method,
-      payment_type: input.payment_type || 'salary',
+      payment_type: paymentType,
       reference_no: input.reference_no?.trim(),
       remarks: input.remarks?.trim(),
       attachments: input.attachments,
@@ -1399,8 +1757,13 @@ class AttendanceService {
       created_at: new Date().toISOString()
     };
 
-    const stored = localStorage.getItem(STORAGE_KEYS.PAYMENTS);
-    const all: SalaryPaymentRecord[] = stored ? JSON.parse(stored) : [];
+    const duplicate = all.find(payment =>
+      this.salaryPaymentDuplicateKey(payment) === this.salaryPaymentDuplicateKey(newPayment)
+    );
+    if (duplicate) {
+      throw new Error(`A matching ${paymentType} payment is already recorded for ${employee.full_name} on ${paymentDate}. Review the payment history before recording it again.`);
+    }
+
     all.unshift(newPayment);
     localStorage.setItem(STORAGE_KEYS.PAYMENTS, JSON.stringify(all));
 
@@ -1413,6 +1776,330 @@ class AttendanceService {
     await dataService.persistCloudState();
 
     return newPayment;
+  }
+
+  public async deleteSalaryPayment(paymentId: string, employeeId: string, groupId?: string): Promise<void> {
+    const currentUser = dataService.getCurrentUser();
+    if (currentUser.role !== 'admin' && currentUser.role !== 'project_manager') {
+      throw new Error('Access Denied: Only Administrators and Project Managers can delete salary transactions.');
+    }
+    await this.refreshPayrollBeforeWrite();
+
+    const paymentsRaw = localStorage.getItem(STORAGE_KEYS.PAYMENTS);
+    const auditRaw = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
+    const payments: SalaryPaymentRecord[] = paymentsRaw ? JSON.parse(paymentsRaw) : [];
+    if (!Array.isArray(payments)) throw new Error('Saved payment data could not be read. Refresh and try again.');
+    const index = payments.findIndex(payment =>
+      payment.id === paymentId
+      && payment.employee_id === employeeId
+      && payment.company_id === currentUser.company_id
+      && (!groupId || groupId === 'all' || payment.group_id === groupId)
+    );
+    if (index < 0) throw new Error('Payment transaction not found. Refresh the payroll table and try again.');
+
+    const [deleted] = payments.splice(index, 1);
+    try {
+      localStorage.setItem(STORAGE_KEYS.PAYMENTS, JSON.stringify(payments));
+      this.recordAudit('delete_salary_payment', deleted.id, {
+        employee_id: deleted.employee_id,
+        amount: deleted.amount,
+        payment_type: deleted.payment_type
+      });
+      await dataService.persistCloudState();
+    } catch (error) {
+      if (paymentsRaw === null) localStorage.removeItem(STORAGE_KEYS.PAYMENTS);
+      else localStorage.setItem(STORAGE_KEYS.PAYMENTS, paymentsRaw);
+      if (auditRaw === null) localStorage.removeItem(STORAGE_KEYS.AUDIT_LOGS);
+      else localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, auditRaw);
+      throw new Error(error instanceof Error
+        ? `Payment deletion was not saved to Supabase. The transaction has been restored. ${error.message}`
+        : 'Payment deletion was not saved to Supabase. The transaction has been restored.');
+    }
+  }
+
+  /** Updates the existing worker, attendance, and payment records used by one salary summary. */
+  public async updateWorkerPayroll(input: WorkerPayrollEditInput): Promise<void> {
+    const currentUser = dataService.getCurrentUser();
+    if (currentUser.role !== 'admin' && currentUser.role !== 'project_manager') {
+      throw new Error('Access Denied: Only Administrators and Project Managers can edit worker payroll.');
+    }
+    if (!this.isValidPayrollDate(input.period_from) || !this.isValidPayrollDate(input.period_to)
+      || input.period_from > input.period_to) {
+      throw new Error('Select a valid payroll period before editing this worker.');
+    }
+
+    await this.refreshPayrollBeforeWrite();
+    this.ensureInitialized();
+
+    const employeesRaw = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
+    const attendanceRaw = localStorage.getItem(STORAGE_KEYS.ATTENDANCE_RECORDS);
+    const paymentsRaw = localStorage.getItem(STORAGE_KEYS.PAYMENTS);
+    const auditRaw = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
+    const employees: Employee[] = employeesRaw ? JSON.parse(employeesRaw) : [];
+    const attendanceRecords: DailyAttendanceRecord[] = attendanceRaw ? JSON.parse(attendanceRaw) : [];
+    const payments: SalaryPaymentRecord[] = paymentsRaw ? JSON.parse(paymentsRaw) : [];
+    if (!Array.isArray(employees) || !Array.isArray(attendanceRecords) || !Array.isArray(payments)) {
+      throw new Error('Saved payroll data could not be read. Refresh and try again.');
+    }
+
+    const employeeIndex = employees.findIndex(employee =>
+      employee.id === input.employee_id && employee.company_id === currentUser.company_id
+    );
+    if (employeeIndex < 0) throw new Error('Worker not found in your company. Refresh and try again.');
+    const existingEmployee = employees[employeeIndex];
+    const fullName = input.employee.full_name.trim();
+    const employeeCode = input.employee.employee_code.trim();
+    const jobType = input.employee.job_type.trim();
+    const salaryAmount = Number(input.employee.salary_amount);
+    const standardHours = Number(input.employee.standard_hours_per_day);
+    const overtimeRate = Number(input.employee.overtime_rate_per_hour);
+    if (!fullName) throw new Error('Worker name is required.');
+    if (!employeeCode) throw new Error('Employee code is required.');
+    if (employees.some((employee, index) => index !== employeeIndex
+      && employee.company_id === currentUser.company_id
+      && employee.employee_code.toLowerCase() === employeeCode.toLowerCase())) {
+      throw new Error(`Employee code "${employeeCode}" is already in use by another worker.`);
+    }
+    if (!jobType) throw new Error('Trade is required.');
+    if (!['daily_wage', 'monthly_salary', 'contract'].includes(input.employee.salary_type)) {
+      throw new Error('Select a valid salary type.');
+    }
+    if (!Number.isFinite(salaryAmount) || salaryAmount <= 0) {
+      throw new Error('Daily wage / salary rate must be greater than zero.');
+    }
+    if (!Number.isFinite(standardHours) || standardHours <= 0 || standardHours > 24) {
+      throw new Error('Standard working hours must be greater than zero and no more than 24.');
+    }
+    if (!Number.isFinite(overtimeRate) || overtimeRate < 0) {
+      throw new Error('Overtime rate cannot be negative or invalid.');
+    }
+
+    const inPeriod = (date: string) => date >= input.period_from && date <= input.period_to;
+    const matchesGroup = (record: { group_id?: string }) => !input.group_id || record.group_id === input.group_id;
+    const targetAttendance = attendanceRecords.filter(record =>
+      record.company_id === currentUser.company_id
+      && record.employee_id === existingEmployee.id
+      && inPeriod(record.date)
+      && matchesGroup(record)
+    );
+    const targetPayments = payments.filter(payment =>
+      payment.company_id === currentUser.company_id
+      && payment.employee_id === existingEmployee.id
+      && inPeriod(payment.payment_date)
+      && matchesGroup(payment)
+    );
+    const attendanceIds = input.attendance.map(record => record.id);
+    const paymentIds = input.payments.map(payment => payment.id);
+    const hasUniqueIds = (ids: string[]) => new Set(ids).size === ids.length;
+    const hasSameIds = (left: string[], right: string[]) => left.length === right.length
+      && left.every(id => right.includes(id));
+    if (!hasUniqueIds(attendanceIds) || !hasSameIds(attendanceIds, targetAttendance.map(record => record.id))) {
+      throw new Error('Attendance changed while this form was open. Refresh the payroll table and try again.');
+    }
+    if (!hasUniqueIds(paymentIds) || !hasSameIds(paymentIds, targetPayments.map(payment => payment.id))) {
+      throw new Error('Payment history changed while this form was open. Refresh the payroll table and try again.');
+    }
+
+    const validStatuses: AttendanceStatus[] = ['Present', 'Absent', 'Half Day', 'Leave', 'Weekly Off', 'Holiday'];
+    const now = new Date().toISOString();
+    const attendanceUpdates = new Map(input.attendance.map(record => [record.id, record]));
+    const originalAttendanceById = new Map(attendanceRecords.map(record => [record.id, record]));
+    const updatedAttendance = attendanceRecords.map(record => {
+      if (record.company_id !== currentUser.company_id || record.employee_id !== existingEmployee.id) return record;
+      const edit = attendanceUpdates.get(record.id);
+      const commonMetadata = {
+        employee_name: fullName,
+        employee_code: employeeCode,
+        job_type: jobType
+      };
+      if (!edit) return { ...record, ...commonMetadata };
+
+      if (!validStatuses.includes(edit.status)) throw new Error(`Select a valid attendance status for ${record.date}.`);
+      if (!this.isValidPayrollDate(edit.date)) throw new Error(`Enter a valid attendance date for ${record.id}.`);
+      if (existingEmployee.joining_date && edit.date < existingEmployee.joining_date) {
+        throw new Error(`Attendance date ${edit.date} cannot be earlier than the worker's joining date.`);
+      }
+      const workingHours = Number(edit.working_hours);
+      const overtimeHours = Number(edit.overtime_hours);
+      if (!Number.isFinite(workingHours) || workingHours < 0 || workingHours > 24) {
+        throw new Error(`Working hours for ${record.date} must be between 0 and 24.`);
+      }
+      if (!Number.isFinite(overtimeHours) || overtimeHours < 0 || overtimeHours > 24) {
+        throw new Error(`Overtime hours for ${record.date} must be between 0 and 24.`);
+      }
+      const paidAttendance = edit.status === 'Present' || edit.status === 'Half Day';
+      if (paidAttendance && workingHours <= 0) {
+        throw new Error(`Enter working hours for ${record.date} when attendance is ${edit.status.toLowerCase()}.`);
+      }
+      if (!paidAttendance && (workingHours !== 0 || overtimeHours !== 0)) {
+        throw new Error(`Non-working attendance on ${record.date} must have zero hours and overtime.`);
+      }
+      if (overtimeHours > 0 && !paidAttendance) {
+        throw new Error(`Overtime on ${record.date} requires present or half-day attendance.`);
+      }
+
+      const earnings = this.calculateDailyEarnings(
+        edit.status,
+        input.employee.salary_type,
+        salaryAmount,
+        overtimeHours,
+        overtimeRate
+      );
+      return {
+        ...record,
+        ...commonMetadata,
+        date: edit.date,
+        status: edit.status,
+        working_hours: workingHours,
+        overtime_hours: overtimeHours,
+        salary_type: input.employee.salary_type,
+        salary_rate: salaryAmount,
+        payable_days: earnings.payableDays,
+        daily_earnings: earnings.dailyEarnings,
+        remarks: edit.remarks?.trim() || undefined,
+        recorded_by: currentUser.id,
+        recorded_by_name: currentUser.full_name,
+        updated_at: now
+      };
+    });
+
+    const groups = await this.getGroups();
+    const projectForAttendance = (record: DailyAttendanceRecord) => record.project_id
+      || groups.find(group => group.id === record.group_id)?.project_id
+      || existingEmployee.project_id
+      || '';
+    for (const edit of input.attendance) {
+      const previous = originalAttendanceById.get(edit.id);
+      if (!previous || previous.date === edit.date) continue;
+      const updated = updatedAttendance.find(record => record.id === edit.id);
+      if (!updated) continue;
+      const projectId = projectForAttendance(updated);
+      const duplicate = updatedAttendance.find(record =>
+        record.id !== updated.id
+        && record.company_id === currentUser.company_id
+        && record.employee_id === existingEmployee.id
+        && record.date === updated.date
+        && projectForAttendance(record) === projectId
+      );
+      if (duplicate) {
+        throw new Error(`Attendance already exists for ${updated.date} on this project. Choose another date or edit the existing record.`);
+      }
+    }
+
+    const paymentUpdates = new Map(input.payments.map(payment => [payment.id, payment]));
+    const originalPaymentsById = new Map(payments.map(payment => [payment.id, payment]));
+    const updatedPayments = payments.map(payment => {
+      if (payment.company_id !== currentUser.company_id || payment.employee_id !== existingEmployee.id) return payment;
+      const commonMetadata = { employee_name: fullName, employee_code: employeeCode };
+      const edit = paymentUpdates.get(payment.id);
+      if (!edit) return { ...payment, ...commonMetadata };
+
+      if (edit.amount === null || edit.amount === undefined || String(edit.amount).trim() === '') {
+        throw new Error(`Enter the saved amount for payment ${payment.id}; an empty amount cannot be treated as zero.`);
+      }
+      const amount = Number(edit.amount);
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error('Payment amounts must be greater than zero.');
+      if (!this.isValidPayrollDate(edit.payment_date)) throw new Error('Enter a valid payment date for every payment.');
+      if (!['Cash', 'Bank Transfer', 'UPI', 'Cheque'].includes(edit.payment_method)) {
+        throw new Error('Select a valid payment method.');
+      }
+      if (!['salary', 'advance', 'bonus', 'deduction'].includes(edit.payment_type)) {
+        throw new Error('Select a valid payment type.');
+      }
+      return {
+        ...payment,
+        ...commonMetadata,
+        payment_date: edit.payment_date,
+        amount,
+        payment_method: edit.payment_method,
+        payment_type: edit.payment_type,
+        reference_no: edit.reference_no?.trim() || undefined,
+        remarks: edit.remarks?.trim() || undefined,
+        attachments: edit.attachments !== undefined ? edit.attachments : payment.attachments
+      };
+    });
+
+    for (const payment of updatedPayments) {
+      const previous = originalPaymentsById.get(payment.id);
+      if (!previous || this.salaryPaymentDuplicateKey(payment) === this.salaryPaymentDuplicateKey(previous)) continue;
+      const duplicate = updatedPayments.find(other =>
+        other.id !== payment.id
+        && this.salaryPaymentDuplicateKey(other) === this.salaryPaymentDuplicateKey(payment)
+      );
+      if (duplicate) {
+        throw new Error(`This change duplicates payment ${duplicate.id}. Check the payment date, amount, type, method, and reference.`);
+      }
+    }
+
+    const updatedEmployee: Employee = {
+      ...existingEmployee,
+      employee_code: employeeCode,
+      full_name: fullName,
+      phone: input.employee.phone?.trim() || undefined,
+      address: input.employee.address?.trim() || undefined,
+      job_type: jobType,
+      salary_type: input.employee.salary_type,
+      salary_amount: salaryAmount,
+      standard_hours_per_day: standardHours,
+      overtime_rate_per_hour: overtimeRate,
+      remarks: input.employee.remarks?.trim() || undefined,
+      updated_at: now
+    };
+    employees[employeeIndex] = updatedEmployee;
+
+    try {
+      localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
+      localStorage.setItem(STORAGE_KEYS.ATTENDANCE_RECORDS, JSON.stringify(updatedAttendance));
+      localStorage.setItem(STORAGE_KEYS.PAYMENTS, JSON.stringify(updatedPayments));
+      this.recordAudit('edit_worker_payroll', existingEmployee.id, {
+        attendance_record_count: input.attendance.length,
+        payment_record_count: input.payments.length,
+        salary_rate: salaryAmount,
+        salary_type: input.employee.salary_type
+      });
+      await dataService.persistCloudState();
+    } catch (error) {
+      if (employeesRaw === null) localStorage.removeItem(STORAGE_KEYS.EMPLOYEES);
+      else localStorage.setItem(STORAGE_KEYS.EMPLOYEES, employeesRaw);
+      if (attendanceRaw === null) localStorage.removeItem(STORAGE_KEYS.ATTENDANCE_RECORDS);
+      else localStorage.setItem(STORAGE_KEYS.ATTENDANCE_RECORDS, attendanceRaw);
+      if (paymentsRaw === null) localStorage.removeItem(STORAGE_KEYS.PAYMENTS);
+      else localStorage.setItem(STORAGE_KEYS.PAYMENTS, paymentsRaw);
+      if (auditRaw === null) localStorage.removeItem(STORAGE_KEYS.AUDIT_LOGS);
+      else localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, auditRaw);
+      throw new Error(error instanceof Error
+        ? `Payroll changes were not saved to Supabase. The prior records have been restored. ${error.message}`
+        : 'Payroll changes were not saved to Supabase. The prior records have been restored.');
+    }
+  }
+
+  public calculatePaymentTotals(
+    paymentRows: Array<Pick<SalaryPaymentRecord, 'amount' | 'payment_date' | 'payment_type'>>,
+    fromDate?: string,
+    toDate?: string
+  ): { advances: number; deductions: number; paid: number; invalidCount: number } {
+    let advances = 0;
+    let deductions = 0;
+    let paid = 0;
+    let invalidCount = 0;
+    for (const payment of paymentRows) {
+      if (!this.isValidPayrollDate(payment.payment_date)
+        || !['salary', 'advance', 'bonus', 'deduction'].includes(payment.payment_type)) {
+        invalidCount++;
+        continue;
+      }
+      if ((fromDate && payment.payment_date < fromDate) || (toDate && payment.payment_date > toDate)) continue;
+      const amount = Number(payment.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        invalidCount++;
+        continue;
+      }
+      if (payment.payment_type === 'advance') advances += amount;
+      else if (payment.payment_type === 'deduction') deductions += amount;
+      else if (payment.payment_type === 'salary' || payment.payment_type === 'bonus') paid += amount;
+      else invalidCount++;
+    }
+    return { advances, deductions, paid, invalidCount };
   }
 
   /**
@@ -1475,15 +2162,10 @@ class AttendanceService {
         grossEarnings += (r.daily_earnings || 0);
       }
 
-      let totalAdvances = 0;
-      let totalDeductions = 0;
-      let totalPaid = 0;
-
-      for (const p of empPayments) {
-        if (p.payment_type === 'advance') totalAdvances += p.amount;
-        else if (p.payment_type === 'deduction') totalDeductions += p.amount;
-        else totalPaid += p.amount; // salary & bonus
-      }
+      const paymentTotals = this.calculatePaymentTotals(empPayments);
+      const totalAdvances = paymentTotals.advances;
+      const totalDeductions = paymentTotals.deductions;
+      const totalPaid = paymentTotals.paid;
 
       const netPayableBalance = grossEarnings - (totalPaid + totalAdvances + totalDeductions);
 
@@ -1604,7 +2286,7 @@ class AttendanceService {
       lines.push(
         [
           escapeCsv(r.group_name),
-          escapeCsv(r.project_name || 'Main Site'),
+          escapeCsv(`${r.project_name || 'Main Site'}${r.site_name ? ` / ${r.site_name}` : ''}`),
           escapeCsv(r.employee_code),
           escapeCsv(r.employee_name),
           escapeCsv(r.job_type),
